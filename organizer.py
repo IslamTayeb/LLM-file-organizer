@@ -1,150 +1,190 @@
-import click
 import os
-import PyPDF2
-import PIL.Image
-import io
-import docx
+from dotenv import load_dotenv
+import argparse
+import google.generativeai as genai
 import json
-from typing import Dict, Any
-from pathlib import Path
+import PyPDF2
+from docx import Document
+import markdown
+from datetime import datetime
+import shlex
+import subprocess
 
-class ContentAnalyzer:
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.extension = Path(file_path).suffix.lower()
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-    def analyze(self) -> Dict[str, Any]:
-        """Analyze file content and return metadata."""
-        if not os.path.exists(self.file_path):
-            return {"error": "File not found"}
 
-        metadata = {
-            "filename": os.path.basename(self.file_path),
-            "extension": self.extension,
-            "size": os.path.getsize(self.file_path),
-            "first_text": "",
-            "preview": ""
-        }
+class DocumentAnalyzer:
+    def __init__(self):
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY not found in .env")
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel("gemini-pro")
+
+    def extract_content(self, file_path):
+        _, ext = os.path.splitext(file_path)
+        ext = ext.lower()
 
         try:
-            if self.extension == '.pdf':
-                metadata.update(self._analyze_pdf())
-            elif self.extension in ['.png', '.jpg', '.jpeg']:
-                metadata.update(self._analyze_image())
-            elif self.extension == '.docx':
-                metadata.update(self._analyze_docx())
-            elif self.extension == '.txt':
-                metadata.update(self._analyze_text())
+            if ext == ".pdf":
+                with open(file_path, "rb") as file:
+                    reader = PyPDF2.PdfReader(file)
+                    text = ""
+                    # Get first 3 pages or all pages if less than 3
+                    for page_num in range(min(3, len(reader.pages))):
+                        text += f"\n=== Page {page_num + 1} ===\n"
+                        text += reader.pages[page_num].extract_text()
+                    return text
+            elif ext == ".docx":
+                doc = Document(file_path)
+                return "\n".join(
+                    [p.text for p in doc.paragraphs[:30]]
+                )  # Increased from 10
+            elif ext in [".txt", ".md"]:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+                    return file.read(10000)  # Increased from 2000
+            return ""
         except Exception as e:
-            metadata["error"] = str(e)
+            print(f"Warning: Cannot read {file_path}: {str(e)}")
+            return ""
 
-        return metadata
+    def get_files_metadata(self, source_dir, depth=1):
+        files_metadata = []
+        valid_extensions = {".pdf", ".docx", ".txt", ".md"}
+        log_entries = []
 
-    def _analyze_pdf(self) -> Dict[str, str]:
-        with open(self.file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            if len(reader.pages) > 0:
-                first_page = reader.pages[0].extract_text()
-                return {
-                    "first_text": first_page[:500],
-                    "preview": first_page[:100]
-                }
-        return {"first_text": "", "preview": ""}
+        source_dir = os.path.expanduser(source_dir)
+        for root, _, files in os.walk(source_dir):
+            if root[len(source_dir) :].count(os.sep) > depth:
+                continue
 
-    def _analyze_image(self) -> Dict[str, str]:
-        with PIL.Image.open(self.file_path) as img:
-            # Create thumbnail
-            img.thumbnail((100, 100))
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=30)
-            return {
-                "preview": f"Image size: {img.size}",
-                "compressed_size": len(buffer.getvalue())
-            }
+            for file in files:
+                if os.path.splitext(file)[1].lower() not in valid_extensions:
+                    continue
 
-    def _analyze_docx(self) -> Dict[str, str]:
-        doc = docx.Document(self.file_path)
-        if doc.paragraphs:
-            first_para = doc.paragraphs[0].text
-            return {
-                "first_text": first_para,
-                "preview": first_para[:100]
-            }
-        return {"first_text": "", "preview": ""}
+                file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(file_path, source_dir)
 
-    def _analyze_text(self) -> Dict[str, str]:
-        with open(self.file_path, 'r', encoding='utf-8') as file:
-            content = file.read()
-            return {
-                "first_text": content[:500],
-                "preview": content[:100]
-            }
+                try:
+                    content = self.extract_content(file_path)
+                    metadata = {
+                        "filename": file,
+                        "absolute_path": file_path,
+                        "relative_path": rel_path,
+                        "content": content,
+                        "extension": os.path.splitext(file)[1].lower(),
+                        "directory": os.path.dirname(rel_path),
+                    }
+                    files_metadata.append(metadata)
 
-class FileOrganizer:
-    def __init__(self, base_path: str):
-        self.base_path = base_path
-        self.metadata_file = os.path.join(base_path, "content_index.json")
-        self.content_index = self._load_index()
+                    # Add to log
+                    log_entries.append(
+                        f"\n{'='*80}\nFile: {file_path}\nContent Preview:\n{content[:500]}...\n{'='*80}\n"
+                    )
+                except Exception as e:
+                    log_entries.append(f"\nERROR processing {file_path}: {str(e)}\n")
 
-    def _load_index(self) -> Dict:
-        if os.path.exists(self.metadata_file):
-            with open(self.metadata_file, 'r') as f:
-                return json.load(f)
-        return {}
+        # Write log file
+        log_path = os.path.join(source_dir, "file_analysis.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(log_entries))
 
-    def _save_index(self):
-        with open(self.metadata_file, 'w') as f:
-            json.dump(self.content_index, f, indent=2)
+        print(f"\nDetailed analysis log written to: {log_path}")
+        return files_metadata, source_dir
 
-    def index_files(self, directory: str):
-        """Index all files in the directory and save their metadata."""
-        for root, _, files in os.walk(directory):
-            for filename in files:
-                file_path = os.path.join(root, filename)
-                analyzer = ContentAnalyzer(file_path)
-                metadata = analyzer.analyze()
-                self.content_index[file_path] = metadata
-        self._save_index()
+    def generate_commands(self, source_dir, query, depth):
+        files_metadata, abs_source = self.get_files_metadata(source_dir, depth)
 
-    def organize_by_query(self, query: str, target_dir: str):
-        """Organize files based on the query into target directory."""
-        os.makedirs(target_dir, exist_ok=True)
+        prompt = f"""Generate file organization commands based on these requirements:
 
-        # Simple keyword matching (can be enhanced with NLP/ML)
-        query = query.lower()
-        for file_path, metadata in self.content_index.items():
-            matches = False
-            for key in ['first_text', 'preview', 'filename']:
-                if key in metadata and query in str(metadata[key]).lower():
-                    matches = True
-                    break
+SOURCE: {abs_source}
+QUERY: {query}
 
-            if matches:
-                dest = os.path.join(target_dir, os.path.basename(file_path))
-                os.symlink(file_path, dest)
+FILES:
+{json.dumps([{
+    "name": m["filename"],
+    "path": m["relative_path"],
+    "content": m["content"] + "..." if m["content"] else ""
+} for m in files_metadata], indent=2)}
 
-@click.group()
-def cli():
-    """Content-aware file organization tool."""
-    pass
+REQUIREMENTS:
+1. Return ONLY a JSON object without code fences or formatting
+2. JSON must have this exact structure:
+{{
+    "explanation": "What the commands will do",
+    "commands": [
+        "mkdir -p folder_name",
+        "cp \\"./file.pdf\\" \\"./folder_name/\\""
+    ]
+}}
 
-@cli.command()
-@click.argument('directory')
-def index(directory):
-    """Index files in the specified directory."""
-    organizer = FileOrganizer(directory)
-    organizer.index_files(directory)
-    click.echo(f"Indexed files in {directory}")
+RULES:
+- Use only mkdir -p and cp commands
+- Always quote file paths
+- Use relative paths from source directory
+- No wildcards or complex commands
+- Target folder name should be simple (no spaces)
+- Each cp command copies one file"""
 
-@cli.command()
-@click.argument('query')
-@click.argument('target_dir')
-@click.option('--base-dir', default=".", help="Base directory containing the index")
-def organize(query, target_dir, base_dir):
-    """Organize files matching the query into target directory."""
-    organizer = FileOrganizer(base_dir)
-    organizer.organize_by_query(query, target_dir)
-    click.echo(f"Organized matching files into {target_dir}")
+        try:
+            response = self.model.generate_content(prompt)
+            # Clean up response text
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = text[text.find("{") : text.rfind("}") + 1]
+            return json.loads(text)
+        except Exception as e:
+            print(f"Error parsing response: {str(e)}")
+            print(f"Raw response:\n{response.text}")
+            return {"explanation": "Failed to generate valid commands", "commands": []}
 
-if __name__ == '__main__':
-    cli()
+
+def safe_execute(source_dir, commands):
+    source_dir = os.path.expanduser(source_dir)
+    os.chdir(source_dir)
+
+    for cmd in commands:
+        try:
+            parts = shlex.split(cmd)
+            if not parts:
+                continue
+
+            # Only allow mkdir and cp
+            if parts[0] not in ["mkdir", "cp"]:
+                print(f"Skipping unauthorized command: {cmd}")
+                continue
+
+            subprocess.run(parts, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Command failed: {cmd}")
+            print(f"Error: {e}")
+            return False
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="File organizer")
+    parser.add_argument("--source", required=True, help="Source directory")
+    parser.add_argument("--query", required=True, help="Organization query")
+    parser.add_argument("--depth", type=int, default=1, help="Directory depth")
+
+    args = parser.parse_args()
+
+    analyzer = DocumentAnalyzer()
+    result = analyzer.generate_commands(args.source, args.query, args.depth)
+
+    print("\nPlan:")
+    print(result["explanation"])
+    print("\nCommands:")
+    for cmd in result["commands"]:
+        print(cmd)
+
+    if input("\nExecute? (y/N): ").lower() == "y":
+        if safe_execute(args.source, result["commands"]):
+            print("Complete!")
+        else:
+            print("Failed.")
+
+
+if __name__ == "__main__":
+    main()
